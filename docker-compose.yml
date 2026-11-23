@@ -1,8 +1,27 @@
-name: printing-erp
+# Printing ERP on Coolify (Docker Compose build pack)
+#
+# Services: postgres, redis, minio, minio-init, backend, frontend.
+# Upstream docker-compose.yml is infra only; this file adds the app services.
+# Data lives in named volumes, never in the image: pgdata, redisdata, miniodata.
+# Never run `docker compose down -v` against this stack.
+#
+# Routing: Traefik routes Host(printcrm.woodwolfdigital.com) to the frontend
+# (nginx, port 8080). Frontend nginx proxies /api and /health to the backend,
+# so the browser talks to a single origin and the backend is never exposed
+# directly. See frontend/nginx.conf in this repo.
+#
+# Secrets: all passwords and the JWT secret come from Coolify env vars, never
+# from this file or the repo. See APP__AUTH__JWT_SECRET, POSTGRES_OWNER_PASSWORD,
+# POSTGRES_APP_PASSWORD, MINIO_ROOT_PASSWORD.
+#
+# S3 presigned URL limit (explicit, not silent): APP__STORAGE__ENDPOINT_URL is
+# http://minio:9000, reachable only inside the compose network. The backend can
+# reach MinIO and verify objects server side, but a browser cannot resolve
+# minio:9000, so presigned upload and download URLs handed to the browser will
+# fail until MinIO is exposed on a public host. Asset upload and download from
+# the browser is therefore a known open limit in this install.
 
-# Local development infrastructure: PostgreSQL (system of record) and Redis
-# (background-job queue / cache). The backend and frontend run on the host
-# during development; only the stateful services are containerized here.
+name: printing-erp
 
 services:
   postgres:
@@ -10,14 +29,11 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: erp
-      POSTGRES_PASSWORD: erp
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD}
       POSTGRES_DB: erp
-    ports:
-      - "5432:5432"
+      ERP_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # Cluster-init scripts (run once on first data-dir creation). Provisions
-      # the least-privilege `erp_app` role required for Row-Level Security.
       - ./db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U erp -d erp"]
@@ -29,8 +45,6 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
-    ports:
-      - "6379:6379"
     volumes:
       - redisdata:/data
     healthcheck:
@@ -39,39 +53,82 @@ services:
       timeout: 3s
       retries: 10
 
-  # S3-compatible object storage for assets (issue #16). In production the app
-  # points at AWS S3 or Cloudflare R2; locally we run MinIO so the full presigned
-  # upload/download flow works offline. The API (9000) is published on localhost
-  # so presigned URLs — which embed the endpoint host — are reachable from the
-  # browser; the console is on 9001.
   minio:
     image: minio/minio:latest
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
-      # Used as the SigV4 access key id / secret by the backend. The password
-      # must be at least 8 characters (MinIO requirement).
-      MINIO_ROOT_USER: erp
-      MINIO_ROOT_PASSWORD: erp_secret_dev
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-erp}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - miniodata:/data
 
-  # One-shot: wait for MinIO, then create the assets bucket. Exits 0 when done.
   minio-init:
     image: minio/mc:latest
     depends_on:
       - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-erp}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     entrypoint: >
       /bin/sh -c "
-      until mc alias set local http://minio:9000 erp erp_secret_dev; do
+      until mc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD; do
         echo 'waiting for minio...'; sleep 1;
       done;
       mc mb --ignore-existing local/erp-assets;
       exit 0;
       "
+    deploy:
+      restart_policy:
+        condition: none
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      APP__SERVER__HOST: 0.0.0.0
+      APP__SERVER__PORT: 8080
+      APP__DATABASE__URL: postgres://erp_app:${POSTGRES_APP_PASSWORD}@postgres:5432/erp
+      APP__DATABASE__ADMIN_URL: postgres://erp:${POSTGRES_OWNER_PASSWORD}@postgres:5432/erp
+      APP__DATABASE__MAX_CONNECTIONS: 10
+      APP__DATABASE__ACQUIRE_TIMEOUT_SECS: 5
+      APP__REDIS__URL: redis://redis:6379
+      APP__STORAGE__ENDPOINT_URL: http://minio:9000
+      APP__STORAGE__REGION: us-east-1
+      APP__STORAGE__BUCKET: erp-assets
+      APP__STORAGE__ACCESS_KEY_ID: ${MINIO_ROOT_USER:-erp}
+      APP__STORAGE__SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      APP__STORAGE__FORCE_PATH_STYLE: "true"
+      APP__AUTH__JWT_SECRET: ${APP__AUTH__JWT_SECRET}
+      APP__AUTH__ISSUER: printing-erp
+      APP__TELEMETRY__SERVICE_NAME: erp-server
+      APP__TELEMETRY__LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - backend
+    labels:
+      - traefik.enable=true
+      - 'traefik.http.routers.printcrm-router.rule=Host(`printcrm.woodwolfdigital.com`)'
+      - traefik.http.routers.printcrm-router.entrypoints=https
+      - traefik.http.routers.printcrm-router.tls=true
+      - traefik.http.routers.printcrm-router.tls.certresolver=letsencrypt
+      - traefik.http.services.printcrm.loadbalancer.server.port=8080
 
 volumes:
   pgdata:
