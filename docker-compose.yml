@@ -54,7 +54,13 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio:latest
+    # Silo (pgsty/silo), community-maintained MinIO fork: same S3 API, same
+    # MINIO_* vars, same `server /data` command, same on-disk format.
+    # minio/minio and minio/mc were deleted from Docker Hub in September 2026
+    # (MinIO community edition archived April 2026), and quay.io/minio now
+    # returns 401 for anonymous pulls, so the upstream images no longer pull.
+    # pgsty/silo and pgsty/mc are active on Docker Hub, last updated Nov 2026.
+    image: pgsty/silo:latest
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
@@ -64,7 +70,7 @@ services:
       - miniodata:/data
 
   minio-init:
-    image: minio/mc:latest
+    image: pgsty/mc:latest
     depends_on:
       - minio
     environment:
