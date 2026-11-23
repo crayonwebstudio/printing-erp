@@ -77,6 +77,17 @@ services:
   # erp_app" until this was added, because the role password in the live
   # database was not the generated one. Idempotent: CREATE is ignored when
   # the role exists, ALTER then sets the password in both cases.
+  #
+  # 2026-11-23 fix: the first version used psql -v app_pass=... with
+  # :'app_pass' inside -c. That did not interpolate: postgres received a
+  # literal :'...' and both statements failed with "syntax error at or
+  # near ':'", while db-init still exited 0, so the deploy proceeded with
+  # no erp_app role at all and the backend crash-looped on
+  # "password authentication failed for user erp_app" / "Role erp_app
+  # does not exist". This version expands the password in the shell
+  # instead (it is 48 hex chars, so single-quote safe) and verifies the
+  # role by logging in as erp_app afterwards. A failure now exits
+  # non-zero, so the deploy fails loudly instead of silently passing.
   db-init:
     image: postgres:17-alpine
     depends_on:
@@ -87,11 +98,13 @@ services:
       ERP_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
     entrypoint: >
       /bin/sh -c "
+      set -e;
       until pg_isready -h postgres -U erp -d erp; do
         echo 'waiting for postgres...'; sleep 1;
       done;
-      psql -h postgres -U erp -d erp -v app_pass=\"$$ERP_APP_PASSWORD\" -c \"CREATE ROLE erp_app LOGIN PASSWORD :'app_pass' NOSUPERUSER NOBYPASSRLS;\" || true;
-      psql -h postgres -U erp -d erp -v ON_ERROR_STOP=1 -v app_pass=\"$$ERP_APP_PASSWORD\" -c \"ALTER ROLE erp_app PASSWORD :'app_pass';\";
+      psql -h postgres -U erp -d erp -v ON_ERROR_STOP=1 -c \"CREATE ROLE erp_app LOGIN PASSWORD '$$ERP_APP_PASSWORD' NOSUPERUSER NOBYPASSRLS;\" || true;
+      psql -h postgres -U erp -d erp -v ON_ERROR_STOP=1 -c \"ALTER ROLE erp_app PASSWORD '$$ERP_APP_PASSWORD';\";
+      PGPASSWORD=\"$$ERP_APP_PASSWORD\" psql -h postgres -U erp_app -d erp -v ON_ERROR_STOP=1 -c 'SELECT 1;' > /dev/null;
       echo 'erp_app role ready';
       exit 0;
       "
