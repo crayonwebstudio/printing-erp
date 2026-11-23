@@ -1,6 +1,6 @@
 # Printing ERP on Coolify (Docker Compose build pack)
 #
-# Services: postgres, redis, minio, minio-init, backend, frontend.
+# Services: postgres, redis, minio, minio-init, db-init, backend, frontend.
 # Upstream docker-compose.yml is infra only; this file adds the app services.
 # Data lives in named volumes, never in the image: pgdata, redisdata, miniodata.
 # Never run `docker compose down -v` against this stack.
@@ -69,6 +69,36 @@ services:
     volumes:
       - miniodata:/data
 
+  # One-shot: create the erp_app runtime role if missing, then set its
+  # password to the generated value, over TCP as the erp owner. This does
+  # not depend on the ./db/init bind mount, which may not run under Coolify
+  # compose confinement; the bind-mount scripts remain for local dev. The
+  # backend failed to start with "password authentication failed for user
+  # erp_app" until this was added, because the role password in the live
+  # database was not the generated one. Idempotent: CREATE is ignored when
+  # the role exists, ALTER then sets the password in both cases.
+  db-init:
+    image: postgres:17-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_OWNER_PASSWORD}
+      ERP_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+      until pg_isready -h postgres -U erp -d erp; do
+        echo 'waiting for postgres...'; sleep 1;
+      done;
+      psql -h postgres -U erp -d erp -v app_pass=\"$$ERP_APP_PASSWORD\" -c \"CREATE ROLE erp_app LOGIN PASSWORD :'app_pass' NOSUPERUSER NOBYPASSRLS;\" || true;
+      psql -h postgres -U erp -d erp -v ON_ERROR_STOP=1 -v app_pass=\"$$ERP_APP_PASSWORD\" -c \"ALTER ROLE erp_app PASSWORD :'app_pass';\";
+      echo 'erp_app role ready';
+      exit 0;
+      "
+    deploy:
+      restart_policy:
+        condition: none
+
   minio-init:
     image: pgsty/mc:latest
     depends_on:
@@ -119,6 +149,8 @@ services:
       minio:
         condition: service_started
       minio-init:
+        condition: service_completed_successfully
+      db-init:
         condition: service_completed_successfully
 
   frontend:
